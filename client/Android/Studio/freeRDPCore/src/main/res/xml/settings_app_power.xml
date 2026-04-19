@@ -7,6 +7,7 @@
         android:key="@string/preference_key_power_disconnect_timeout"
         android:numeric="integer"
         android:title="@string/settings_power_disconnect_timeout"
+        android:dialogMessage="@string/settings_power_disconnect_timeout_dialog_message"
         freerdp:bounds_default="5"
         freerdp:bounds_max="30"
         freerdp:bounds_min="0" />

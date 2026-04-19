@@ -171,6 +171,7 @@
     <string name="settings_cat_power">Power Saving</string>
     <string name="settings_cat_client">Client</string>
     <string name="settings_power_disconnect_timeout">Close idle Connections</string>
+    <string name="settings_power_disconnect_timeout_dialog_message">after X minutes (range: 0 ~ 30, default: 5, 0 means unlimited)</string>
     <string name="settings_cat_security">Security</string>
     <string name="settings_security_accept_certificates">Accept all Certificates</string>
     <string name="settings_security_clear_certificate_cache">Clear Certificate Cache</string>
