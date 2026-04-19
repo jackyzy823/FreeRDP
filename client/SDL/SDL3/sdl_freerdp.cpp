@@ -649,6 +649,11 @@ int main(int argc, char* argv[])
 		return rc;
 	}
 
+#if SDL_VERSION_ATLEAST(3, 2, 0)
+	/* Should run before SDL initialization */
+	SDL_SetHint(SDL_HINT_SCREENSAVER_INHIBIT_ACTIVITY_NAME, "Showing remote desktop");
+#endif
+
 	/* Basic SDL initialization */
 	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
 		return -1;
