@@ -122,7 +122,7 @@ struct xf_clipboard
 	/* item SelectionRespond* */
 	wArrayList* pending_responds;
 	/* item SelectionRespond* */
-	wArrayList* queued_responds;
+	wQueue* queued_responds;
 
 	Window owner;
 	BOOL sync;
@@ -215,37 +215,38 @@ static void selection_respond_free(void* ptr)
 	free(selection_respond);
 }
 
-static BOOL selection_respond_deep_copy(SelectionRespond** ppDst, SelectionRespond* pSrc)
-{
-	if (!ppDst)
-	{
-		return FALSE;
-	}
-
-	SelectionRespond* obj = calloc(1, sizeof(SelectionRespond));
-	if (!obj)
-		return FALSE;
-
-	obj->data_raw_format = pSrc->data_raw_format;
-	if (!requested_format_replace(&obj->requestedFormat, pSrc->requestedFormat->formatToRequest,
-	                              pSrc->requestedFormat->localFormat,
-	                              pSrc->requestedFormat->formatName))
-	{
-		free(obj);
-		return FALSE;
-	}
-
-	obj->respond = calloc(1, sizeof(XSelectionEvent));
-	if (!obj->respond)
-	{
-		requested_format_free(&obj->requestedFormat);
-		free(obj);
-		return FALSE;
-	}
-	memcpy(obj->respond, pSrc->respond, sizeof(XSelectionEvent));
-	*ppDst = obj;
-	return True;
-}
+// // for ArrayList GetItem and then Remove, it will be free-ed
+// static BOOL selection_respond_deep_copy(SelectionRespond** ppDst, SelectionRespond* pSrc)
+// {
+// 	if (!ppDst)
+// 	{
+// 		return FALSE;
+// 	}
+//
+// 	SelectionRespond* obj = calloc(1, sizeof(SelectionRespond));
+// 	if (!obj)
+// 		return FALSE;
+//
+// 	obj->data_raw_format = pSrc->data_raw_format;
+// 	if (!requested_format_replace(&obj->requestedFormat, pSrc->requestedFormat->formatToRequest,
+// 	                              pSrc->requestedFormat->localFormat,
+// 	                              pSrc->requestedFormat->formatName))
+// 	{
+// 		free(obj);
+// 		return FALSE;
+// 	}
+//
+// 	obj->respond = calloc(1, sizeof(XSelectionEvent));
+// 	if (!obj->respond)
+// 	{
+// 		requested_format_free(&obj->requestedFormat);
+// 		free(obj);
+// 		return FALSE;
+// 	}
+// 	memcpy(obj->respond, pSrc->respond, sizeof(XSelectionEvent));
+// 	*ppDst = obj;
+// 	return True;
+// }
 
 static void xf_cached_data_free(void* ptr)
 {
@@ -1766,9 +1767,9 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					{
 						// different (or uncertain) format , append to queued , not send
 						// data_request (will do in data_response)
-						ArrayList_Lock(clipboard->queued_responds);
-						ArrayList_Append(clipboard->queued_responds, selection_respond);
-						ArrayList_Unlock(clipboard->queued_responds);
+						Queue_Lock(clipboard->queued_responds);
+						Queue_Enqueue(clipboard->queued_responds, selection_respond);
+						Queue_Unlock(clipboard->queued_responds);
 					}
 					else
 					{
@@ -2155,7 +2156,7 @@ static UINT xf_cliprdr_server_format_list(CliprdrClientContext* context,
 
 	/* Clear the active SelectionRequest, as it is now invalid */
 	ArrayList_Clear(clipboard->pending_responds);
-	ArrayList_Clear(clipboard->queued_responds);
+	Queue_Clear(clipboard->queued_responds);
 
 	xf_clipboard_formats_free(clipboard);
 	xf_cliprdr_clear_cached_data(clipboard);
@@ -2574,45 +2575,48 @@ nextformat:
 	// find all other in queued_responds, which has same format id as the first one
 	// put them in pending_responds;
 	// send data_request;
-	ArrayList_Lock(clipboard->queued_responds);
+	Queue_Lock(clipboard->queued_responds);
 
-	if (!(ArrayList_Count(clipboard->queued_responds) > 0))
+	if (!(Queue_Count(clipboard->queued_responds) > 0))
 		goto out2;
 
-	SelectionRespond* next = ArrayList_GetItem(clipboard->queued_responds, 0);
+	SelectionRespond* next = Queue_Dequeue(clipboard->queued_responds);
 	// any way to not clone one ? since arraylist_remove will free
 	UINT32 nextFormatId = next->requestedFormat->formatToRequest;
 	const xfCliprdrFormat* cformat =
 		xf_cliprdr_get_client_format_by_atom(clipboard, next->respond->target);
 	// since we have no ownership,
-	SelectionRespond* dup = nullptr;
-	BOOL res = selection_respond_deep_copy(&dup, next);
-	if (!res)
-		// since no following data_request sent, these queued will be trigger only after another
-		// data_request from process_selection_request.
-		goto out2;
-	ArrayList_Remove(clipboard->queued_responds, next);
-	ArrayList_Append(clipboard->pending_responds, dup);
+	ArrayList_Append(clipboard->pending_responds, next);
 
-	for (size_t idx = 0; idx < ArrayList_Count(clipboard->queued_responds);)
+	// we need a backlog queue
+	wQueue* backlog = Queue_New(TRUE, -1, -1);
+	while (Queue_Count(clipboard->queued_responds) > 0)
 	{
-		SelectionRespond* cur = ArrayList_GetItem(clipboard->queued_responds, idx);
+		SelectionRespond* cur = Queue_Dequeue(clipboard->queued_responds);
 		if (cur->requestedFormat->formatToRequest == nextFormatId)
 		{
-
-			SelectionRespond* copy = nullptr;
-			BOOL res = selection_respond_deep_copy(&copy, cur);
-			if (!res)
-				// since no following data_request sent, these queued will be trigger only after
-				// another data_request from process_selection_request.
-				goto out2;
-
-			ArrayList_RemoveAt(clipboard->queued_responds, idx);
-			ArrayList_Append(clipboard->pending_responds, copy);
+			ArrayList_Append(clipboard->pending_responds, cur);
 		}
 		else
-			idx += 1;
+		{
+			Queue_Enqueue(backlog, cur);
+		}
 	}
+	WINPR_ASSERT(Queue_Count(clipboard->queued_responds) == 0);
+
+	// replace the old queue with backlog , or  push item in backlog into it?
+
+	// what about lock?
+	// Queue_Free(clipboard->queued_responds);
+	// clipboard->queued_responds = backlog;
+
+	while (Queue_Count(backlog) > 0)
+	{
+		Queue_Enqueue(clipboard->queued_responds, Queue_Dequeue(backlog));
+	}
+	WINPR_ASSERT(Queue_Count(backlog) == 0);
+
+	Queue_Free(backlog);
 
 out2:
 	if (nextFormatId && ArrayList_Count(clipboard->pending_responds) > 0)
@@ -2620,7 +2624,7 @@ out2:
 		xf_cliprdr_send_data_request(clipboard, nextFormatId, cformat);
 	}
 
-	ArrayList_Unlock(clipboard->queued_responds);
+	Queue_Unlock(clipboard->queued_responds);
 
 	ArrayList_Unlock(clipboard->pending_responds);
 
@@ -2890,10 +2894,10 @@ xfClipboard* xf_clipboard_new(xfContext* xfc, BOOL relieveFilenameRestriction)
 	obj = ArrayList_Object(clipboard->pending_responds);
 	obj->fnObjectFree = selection_respond_free;
 
-	clipboard->queued_responds = ArrayList_New(TRUE);
+	clipboard->queued_responds = Queue_New(TRUE, -1, -1);
 	if (!clipboard->queued_responds)
 		goto fail;
-	obj = ArrayList_Object(clipboard->queued_responds);
+	obj = Queue_Object(clipboard->queued_responds);
 	obj->fnObjectFree = selection_respond_free;
 
 	return clipboard;
@@ -2929,7 +2933,7 @@ void xf_clipboard_free(xfClipboard* clipboard)
 	HashTable_Free(clipboard->cachedRawData);
 	HashTable_Free(clipboard->cachedData);
 	ArrayList_Free(clipboard->pending_responds);
-	ArrayList_Free(clipboard->queued_responds);
+	Queue_Free(clipboard->queued_responds);
 	free(clipboard->incr_data);
 	free(clipboard);
 }
