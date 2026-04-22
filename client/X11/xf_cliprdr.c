@@ -1751,7 +1751,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				// the new d2 format will returned with empty data (and wrong property)
 				//
 
-				ArrayList_Lock(clipboard->pending_responds);
+				// ArrayList_Lock(clipboard->pending_responds);
 				if (ArrayList_Count(clipboard->pending_responds) > 0)
 				{
 					// if any of pending_responds's server formatId != current formatId , all drop
@@ -1789,7 +1789,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					ArrayList_Append(clipboard->pending_responds, selection_respond);
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
-				ArrayList_Unlock(clipboard->pending_responds);
+				// ArrayList_Unlock(clipboard->pending_responds);
 			}
 		}
 	}
@@ -2334,7 +2334,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 	const UINT32 size = formatDataResponse->common.dataLen;
 	const BYTE* data = formatDataResponse->requestedFormatData;
 
-	ArrayList_Lock(clipboard->pending_responds);
+	// ArrayList_Lock(clipboard->pending_responds);
 	if (formatDataResponse->common.msgFlags == CB_RESPONSE_FAIL)
 	{
 		WLog_WARN(TAG, "Format Data Response PDU msgFlags is CB_RESPONSE_FAIL");
@@ -2626,7 +2626,7 @@ out2:
 
 	Queue_Unlock(clipboard->queued_responds);
 
-	ArrayList_Unlock(clipboard->pending_responds);
+	// ArrayList_Unlock(clipboard->pending_responds);
 
 	return CHANNEL_RC_OK;
 }
