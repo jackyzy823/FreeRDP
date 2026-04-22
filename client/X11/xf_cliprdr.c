@@ -1654,11 +1654,24 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				 * Response will be postponed after receiving the data
 				 */
 				// propery will be used in format_data_response
-				respond->property = xevent->property;
 
 				SelectionRespond* selection_respond = nullptr;
 				if (!(selection_respond = (SelectionRespond*)calloc(1, sizeof(SelectionRespond))))
+				{
+					// TODO bring back delay , since
+					union
+					{
+						XEvent* ev;
+						XSelectionEvent* sev;
+					} conv;
+
+					conv.sev = respond;
+					LogDynAndXSendEvent(xfc->log, xfc->display, xevent->requestor, 0, 0, conv.ev);
+					LogDynAndXFlush(xfc->log, xfc->display);
+					free(respond);
 					return FALSE;
+				}
+				respond->property = xevent->property;
 
 				selection_respond->respond = respond;
 				requested_format_replace(&selection_respond->requestedFormat, formatId, dstFormatId,
