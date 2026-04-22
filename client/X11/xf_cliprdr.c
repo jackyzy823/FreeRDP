@@ -1516,7 +1516,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 	UINT32 formatId = 0;
 	XSelectionEvent* respond = nullptr;
 	BYTE* data = nullptr;
-	BOOL delayRespond = 0;
 	BOOL rawTransfer = 0;
 	unsigned long length = 0;
 	unsigned long bytes_left = 0;
@@ -1530,8 +1529,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 
 	if (xevent->owner != xfc->drawable)
 		return FALSE;
-
-	delayRespond = FALSE;
 
 	if (!(respond = (XSelectionEvent*)calloc(1, sizeof(XSelectionEvent))))
 	{
@@ -1597,7 +1594,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				table = clipboard->cachedRawData;
 
 			// lock here in case cache not prepared.
-			// Queue_Lock(clipboard->queued_responds);
 			HashTable_Lock(table);
 
 			if (!rawTransfer)
@@ -1615,6 +1611,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 
 				get_src_format_info_for_local_request(clipboard, cformat, &srcFormatId,
 				                                      &nullTerminated);
+				// TODO here should lock?
 				cached_raw_data =
 				    HashTable_GetItemValue(clipboard->cachedRawData, (void*)(UINT_PTR)srcFormatId);
 
@@ -1625,6 +1622,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					cached_data = convert_data_from_existing_raw_data(
 					    clipboard, cached_raw_data, srcFormatId, nullTerminated, dstFormatId);
 			}
+			HashTable_Unlock(table);
 
 			DEBUG_CLIPRDR("hasCachedData: %u", cached_data ? 1u : 0u);
 
@@ -1636,6 +1634,16 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
 				xf_cliprdr_provide_data(clipboard, respond, cached_data->data,
 				                        cached_data->data_length);
+				union
+				{
+					XEvent* ev;
+					XSelectionEvent* sev;
+				} conv;
+
+				conv.sev = respond;
+				LogDynAndXSendEvent(xfc->log, xfc->display, xevent->requestor, 0, 0, conv.ev);
+				LogDynAndXFlush(xfc->log, xfc->display);
+				free(respond);
 			}
 			else
 			{
@@ -1645,43 +1653,28 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				 * Send clipboard data request to the server.
 				 * Response will be postponed after receiving the data
 				 */
+				// propery will be used in format_data_response
 				respond->property = xevent->property;
 
 				SelectionRespond* selection_respond = nullptr;
 				if (!(selection_respond = (SelectionRespond*)calloc(1, sizeof(SelectionRespond))))
-					goto out;
+					return FALSE;
 
-				delayRespond = TRUE;
 				selection_respond->respond = respond;
 				requested_format_replace(&selection_respond->requestedFormat, formatId, dstFormatId,
 				                         cformat->formatName);
 				selection_respond->data_raw_format = rawTransfer;
 
+				// Queue_Lock(clipboard->queued_responds);
 				Queue_Enqueue(clipboard->queued_responds, selection_respond);
 				// new one, else waiting for format_data_response handle it
 				if (Queue_Count(clipboard->queued_responds) == 1)
 				{
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
+				// Queue_Unlock(clipboard->queued_responds);
 			}
-		out:
-			HashTable_Unlock(table);
-			// Queue_Unlock(clipboard->queued_responds);
 		}
-	}
-
-	if (!delayRespond)
-	{
-		union
-		{
-			XEvent* ev;
-			XSelectionEvent* sev;
-		} conv;
-
-		conv.sev = respond;
-		LogDynAndXSendEvent(xfc->log, xfc->display, xevent->requestor, 0, 0, conv.ev);
-		LogDynAndXFlush(xfc->log, xfc->display);
-		free(respond);
 	}
 
 	return TRUE;
@@ -2263,6 +2256,8 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		{
 			// TODO respond self failed, go to fail (send response without provide data and free
 			// response)  and continue
+			// indicate fail to client
+			cur->respond->property = None;
 			goto fail;
 		}
 		else if (format->formatName)
@@ -2349,6 +2344,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			{
 				// TODO respond self failed, go to fail (send response without provide data and free
 				// response)  and continue
+				cur->respond->property = None;
 				goto fail;
 			}
 		}
