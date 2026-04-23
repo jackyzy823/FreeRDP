@@ -1696,40 +1696,26 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 			}
 			else
 			{
-				BOOL shouldQueued = FALSE;
-				BOOL success = FALSE;
-				BOOL shouldSkip = FALSE;
 				SelectionRespond* selection_respond = nullptr;
 				WINPR_ASSERT(cformat);
 
-				respond->property = xevent->property;
-
 				if (!(selection_respond = (SelectionRespond*)calloc(1, sizeof(SelectionRespond))))
 				{
-					// if alloc failed, just ignore??
-					free(respond);
-					return FALSE;
+					// respond with property none to indicate conversion failed
+					// no delayRespond,
+					//
+					respond->property = None;
+					goto out;
 				}
-
+				respond->property = xevent->property;
 				delayRespond = TRUE;
+
 				selection_respond->respond = respond;
 				requested_format_replace(&selection_respond->requestedFormat, formatId, dstFormatId,
 				                         cformat->formatName);
 				selection_respond->data_raw_format = rawTransfer;
 				// NOTE: we should ensure all pending_responds has same `formatId` (like 0x0000000d
 				// [CF_UNICODETEXT])
-				// TODO: what if we have cached d1 format request and sent
-				// xf_cliprdr_send_data_request and before  d1 format data_response go to
-				// xf_cliprdr_server_format_data_response, now, a d2 format request cames , we drop
-				// pending list , and add this to empty pending list when d1 format data_response go
-				// to xf_cliprdr_server_format_data_response, we have pending list with d2 format
-				// request ??
-				//
-				// TODO: or we should cache all different format, only clear it when
-				// xf_cliprdr_server_format_list invalid it? and in
-				// xf_cliprdr_server_format_data_response we process it if format match (but how,
-				// the response don't have formatid)
-				//
 				//
 				// TODO: if cache data is not hit , if pending_list is not null , and my format ==
 				// pending_list foramt , put it in cache?
@@ -1737,29 +1723,22 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				// pending_list foramt , put it to a waiting_hashtable, (hashtable[formatid] =
 				// pending_list)
 				//		if cache data is not hit, if pending_list is null and
-				//waiting_hashtable[myformat] is null -->  put it in pending_list and send
-				//send_data_request 		if cache data is not hit, if pending_list is null and
-				//waiting_hashtable[myformat] is not null -->  put it in a waiting_hashtable
+				// waiting_hashtable[myformat] is null -->  put it in pending_list and send
+				// send_data_request 		if cache data is not hit, if pending_list is null and
+				// waiting_hashtable[myformat] is not null -->  put it in a waiting_hashtable
 				//
 				//		when response , iterater pending_list ,and clean it up, then if
-				//waiting_hashtable is not null , pop first key 's data, set it to pending_list (and
-				//then unlock pending_list) , and send_data_request 	what if we didn't receive
-				//previous formatId's data_response and then we can't emit send_data_request for
-				//next formatid
-				//
-				// In old implmentation, if we have a d1 format clipboard->respond
-				// the new d2 format will returned with empty data (and wrong property)
+				// waiting_hashtable is not null , pop first key 's data, set it to pending_list
+				// (and then unlock pending_list) , and send_data_request 	what if we didn't
+				// receive previous formatId's data_response and then we can't emit
+				// send_data_request for next formatid
 				//
 
 				// ArrayList_Lock(clipboard->pending_responds);
 				if (ArrayList_Count(clipboard->pending_responds) > 0)
 				{
-					// if any of pending_responds's server formatId != current formatId , all drop
-					// pending_responds
-
-					// And if we have a list with same server formatId, we could skip
-					// xf_cliprdr_send_data_request for this request, just adding it to the
-					// pending list
+					BOOL shouldQueued = FALSE;
+					BOOL success = FALSE;
 					success = ArrayList_ForEach(clipboard->pending_responds,
 					                            xf_cliprdr_pending_responds_ArrayList_ForEachFkt,
 					                            formatId, &shouldQueued);
@@ -1789,6 +1768,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					ArrayList_Append(clipboard->pending_responds, selection_respond);
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
+			out:
 				// ArrayList_Unlock(clipboard->pending_responds);
 			}
 		}
@@ -2338,7 +2318,29 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 	if (formatDataResponse->common.msgFlags == CB_RESPONSE_FAIL)
 	{
 		WLog_WARN(TAG, "Format Data Response PDU msgFlags is CB_RESPONSE_FAIL");
-		ArrayList_Clear(clipboard->pending_responds);
+		ArrayList_Lock(clipboard->pending_responds);
+		while (ArrayList_Count(clipboard->pending_responds) > 0)
+		{
+			SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
+			// set the property argument to None indicates that the conversion requested could not
+			// be made.
+			pending->respond->property = None;
+			{
+				union
+				{
+					XEvent* ev;
+					XSelectionEvent* sev;
+				} conv;
+
+				conv.sev = pending->respond;
+
+				LogDynAndXSendEvent(xfc->log, xfc->display, pending->respond->requestor, 0, 0,
+				                    conv.ev);
+				LogDynAndXFlush(xfc->log, xfc->display);
+			}
+			ArrayList_Remove(clipboard->pending_responds, pending);
+		}
+		ArrayList_Unlock(clipboard->pending_responds);
 		// TODO if queued_respond , send next data_request
 		goto nextformat;
 	}
@@ -2346,6 +2348,8 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 	// TODO if queued_respond , send next data_request
 	if (ArrayList_Count(clipboard->pending_responds) == 0)
 		goto nextformat;
+
+	SelectionRespond* first = ArrayList_GetItem(clipboard->pending_responds, 0);
 
 	while (ArrayList_Count(clipboard->pending_responds) > 0)
 	{
@@ -2577,50 +2581,40 @@ nextformat:
 	// send data_request;
 	Queue_Lock(clipboard->queued_responds);
 
-	if (!(Queue_Count(clipboard->queued_responds) > 0))
-		goto out2;
-
-	SelectionRespond* next = Queue_Dequeue(clipboard->queued_responds);
-	// any way to not clone one ? since arraylist_remove will free
-	UINT32 nextFormatId = next->requestedFormat->formatToRequest;
-	const xfCliprdrFormat* cformat =
-		xf_cliprdr_get_client_format_by_atom(clipboard, next->respond->target);
-	// since we have no ownership,
-	ArrayList_Append(clipboard->pending_responds, next);
-
-	// we need a backlog queue
-	wQueue* backlog = Queue_New(TRUE, -1, -1);
-	while (Queue_Count(clipboard->queued_responds) > 0)
+	SelectionRespond* next = Queue_Peek(clipboard->queued_responds);
+	if (next)
 	{
-		SelectionRespond* cur = Queue_Dequeue(clipboard->queued_responds);
-		if (cur->requestedFormat->formatToRequest == nextFormatId)
+		UINT32 nextFormatId = next->requestedFormat->formatToRequest;
+		const xfCliprdrFormat* cformat =
+		    xf_cliprdr_get_client_format_by_atom(clipboard, next->respond->target);
+
+		wQueue* baclog = Queue_New(TRUE, -1, -1);
+		while ((next = Queue_Dequeue(clipboard->queued_responds)) != nullptr)
 		{
-			ArrayList_Append(clipboard->pending_responds, cur);
+			if (next->requestedFormat->formatToRequest == nextFormatId)
+			{
+				ArrayList_Append(clipboard->pending_responds, next);
+			}
+			else
+			{
+				Queue_Enqueue(backlog, next);
+			}
 		}
-		else
+		WINPR_ASSERT(Queue_Count(clipboard->queued_responds) == 0);
+
+		// replace the old queue with backlog , or  push item in backlog into it?
+
+		// what about lock?
+		// Queue_Free(clipboard->queued_responds);
+		// clipboard->queued_responds = backlog;
+
+		while (Queue_Count(backlog) > 0)
 		{
-			Queue_Enqueue(backlog, cur);
+			Queue_Enqueue(clipboard->queued_responds, Queue_Dequeue(backlog));
 		}
-	}
-	WINPR_ASSERT(Queue_Count(clipboard->queued_responds) == 0);
+		WINPR_ASSERT(Queue_Count(backlog) == 0);
+		Queue_Free(backlog);
 
-	// replace the old queue with backlog , or  push item in backlog into it?
-
-	// what about lock?
-	// Queue_Free(clipboard->queued_responds);
-	// clipboard->queued_responds = backlog;
-
-	while (Queue_Count(backlog) > 0)
-	{
-		Queue_Enqueue(clipboard->queued_responds, Queue_Dequeue(backlog));
-	}
-	WINPR_ASSERT(Queue_Count(backlog) == 0);
-
-	Queue_Free(backlog);
-
-out2:
-	if (nextFormatId && ArrayList_Count(clipboard->pending_responds) > 0)
-	{
 		xf_cliprdr_send_data_request(clipboard, nextFormatId, cformat);
 	}
 
