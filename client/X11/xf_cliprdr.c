@@ -1565,6 +1565,28 @@ static BOOL xf_cliprdr_pending_responds_ArrayList_ForEachFkt(void* data, size_t 
 	return TRUE;
 }
 
+#define xf_cliprdr_provide_selection(clipboard, respond) \
+	xf_cliprdr_provide_selection_((clipboard), (respond), __FILE__, __func__, __LINE__)
+static void xf_cliprdr_provide_selection_(xfClipboard* clipboard, const XSelectionEvent* respond,
+                                          const char* file, const char* fkt, size_t line)
+{
+	WINPR_ASSERT(clipboard);
+
+	xfContext* xfc = clipboard->xfc;
+	WINPR_ASSERT(xfc);
+
+	// Allow respond->property to be None and
+	union
+	{
+		XEvent* ev;
+		XSelectionEvent* sev;
+	} conv;
+
+	conv.sev = respond;
+	LogDynAndXSendEvent(xfc->log, xfc->display, respond->requestor, 0, 0, conv.ev);
+	LogDynAndXFlush(xfc->log, xfc->display);
+}
+
 static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
                                                  const XSelectionRequestEvent* xevent)
 {
@@ -1653,8 +1675,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 			if (rawTransfer)
 				table = clipboard->cachedRawData;
 
-			HashTable_Lock(table);
-
 			if (!rawTransfer)
 				cached_data = HashTable_GetItemValue(table, format_to_cache_slot(dstFormatId));
 			else
@@ -1682,8 +1702,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 			}
 
 			DEBUG_CLIPRDR("hasCachedData: %u", cached_data ? 1u : 0u);
-
-			HashTable_Unlock(table);
 
 			if (cached_data)
 			{
@@ -1734,7 +1752,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				// send_data_request for next formatid
 				//
 
-				// ArrayList_Lock(clipboard->pending_responds);
 				if (ArrayList_Count(clipboard->pending_responds) > 0)
 				{
 					BOOL shouldQueued = FALSE;
@@ -1746,13 +1763,13 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					{
 						// different (or uncertain) format , append to queued , not send
 						// data_request (will do in data_response)
-						Queue_Lock(clipboard->queued_responds);
+						// TODO failed to enqueue
 						Queue_Enqueue(clipboard->queued_responds, selection_respond);
-						Queue_Unlock(clipboard->queued_responds);
 					}
 					else
 					{
 						// same format , append to pending , but not send data_request
+						// TODO failed to append
 						ArrayList_Append(clipboard->pending_responds, selection_respond);
 					}
 				}
@@ -1765,26 +1782,18 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					// we will always add current one to the pending_response
 
 					// brand new , add to pendingm and send data_request
+					// TODO failed to append
 					ArrayList_Append(clipboard->pending_responds, selection_respond);
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
-			out:
-				// ArrayList_Unlock(clipboard->pending_responds);
 			}
 		}
 	}
 
+out:
 	if (!delayRespond)
 	{
-		union
-		{
-			XEvent* ev;
-			XSelectionEvent* sev;
-		} conv;
-
-		conv.sev = respond;
-		LogDynAndXSendEvent(xfc->log, xfc->display, xevent->requestor, 0, 0, conv.ev);
-		LogDynAndXFlush(xfc->log, xfc->display);
+		xf_cliprdr_provide_selection(clipboard, respond);
 		free(respond);
 	}
 
@@ -2314,42 +2323,25 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 	const UINT32 size = formatDataResponse->common.dataLen;
 	const BYTE* data = formatDataResponse->requestedFormatData;
 
-	// ArrayList_Lock(clipboard->pending_responds);
 	if (formatDataResponse->common.msgFlags == CB_RESPONSE_FAIL)
 	{
 		WLog_WARN(TAG, "Format Data Response PDU msgFlags is CB_RESPONSE_FAIL");
-		ArrayList_Lock(clipboard->pending_responds);
 		while (ArrayList_Count(clipboard->pending_responds) > 0)
 		{
 			SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
 			// set the property argument to None indicates that the conversion requested could not
 			// be made.
 			pending->respond->property = None;
-			{
-				union
-				{
-					XEvent* ev;
-					XSelectionEvent* sev;
-				} conv;
-
-				conv.sev = pending->respond;
-
-				LogDynAndXSendEvent(xfc->log, xfc->display, pending->respond->requestor, 0, 0,
-				                    conv.ev);
-				LogDynAndXFlush(xfc->log, xfc->display);
-			}
+			xf_cliprdr_provide_selection(clipboard, pending->respond);
 			ArrayList_Remove(clipboard->pending_responds, pending);
 		}
-		ArrayList_Unlock(clipboard->pending_responds);
-		// TODO if queued_respond , send next data_request
+		// This goto could be omit, since ArrayList_Count(clipboard->pending_responds) new is 0
+		// here. we can just use next goto
 		goto nextformat;
 	}
 
-	// TODO if queued_respond , send next data_request
 	if (ArrayList_Count(clipboard->pending_responds) == 0)
 		goto nextformat;
-
-	SelectionRespond* first = ArrayList_GetItem(clipboard->pending_responds, 0);
 
 	while (ArrayList_Count(clipboard->pending_responds) > 0)
 	{
@@ -2371,6 +2363,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		}
 		else if (!format)
 		{
+			pending->respond->property = None;
 			goto out;
 		}
 		else if (format->formatName)
@@ -2553,20 +2546,9 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		}
 
 		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
-		{
-			union
-			{
-				XEvent* ev;
-				XSelectionEvent* sev;
-			} conv;
-
-			conv.sev = pending->respond;
-
-			LogDynAndXSendEvent(xfc->log, xfc->display, pending->respond->requestor, 0, 0, conv.ev);
-			LogDynAndXFlush(xfc->log, xfc->display);
-		}
 
 	out:
+		xf_cliprdr_provide_selection(clipboard, pending->respond);
 		// whatever success or failed, clean it up
 		ArrayList_Remove(clipboard->pending_responds, pending);
 	}
@@ -2579,7 +2561,6 @@ nextformat:
 	// find all other in queued_responds, which has same format id as the first one
 	// put them in pending_responds;
 	// send data_request;
-	Queue_Lock(clipboard->queued_responds);
 
 	SelectionRespond* next = Queue_Peek(clipboard->queued_responds);
 	if (next)
@@ -2588,7 +2569,7 @@ nextformat:
 		const xfCliprdrFormat* cformat =
 		    xf_cliprdr_get_client_format_by_atom(clipboard, next->respond->target);
 
-		wQueue* baclog = Queue_New(TRUE, -1, -1);
+		wQueue* backlog = Queue_New(FALSE, -1, -1);
 		while ((next = Queue_Dequeue(clipboard->queued_responds)) != nullptr)
 		{
 			if (next->requestedFormat->formatToRequest == nextFormatId)
@@ -2617,10 +2598,6 @@ nextformat:
 
 		xf_cliprdr_send_data_request(clipboard, nextFormatId, cformat);
 	}
-
-	Queue_Unlock(clipboard->queued_responds);
-
-	// ArrayList_Unlock(clipboard->pending_responds);
 
 	return CHANNEL_RC_OK;
 }
