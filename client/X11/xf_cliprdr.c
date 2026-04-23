@@ -2352,7 +2352,6 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		UINT32 dstFormatId = 0;
 		BOOL nullTerminated = FALSE;
 		xfCachedData* cached_data = nullptr;
-		xfCachedData* hit_cached_data = nullptr;
 
 		SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
 		const RequestedFormat* format = pending->requestedFormat;
@@ -2482,30 +2481,9 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			goto out;
 		}
 
-		wHashTable* table = clipboard->cachedData;
-		if (pending->data_raw_format)
-			table = clipboard->cachedRawData;
-
-		// cache is useful , like (s1, t1), (s1,t2) , (s1,t1) <- for this one
-		if (!pending->data_raw_format)
-			hit_cached_data = HashTable_GetItemValue(table, format_to_cache_slot(dstFormatId));
-		else
-			hit_cached_data = HashTable_GetItemValue(table, format_to_cache_slot(srcFormatId));
-
-		DEBUG_CLIPRDR("hasCachedData: %u, pending->data_raw_format: %d", hit_cached_data ? 1u : 0u,
-		              pending->data_raw_format);
-
 		ClipboardLock(clipboard->system);
-		if (hit_cached_data)
-		{
-			pDstData = hit_cached_data->data;
-			DstSize = hit_cached_data->data_length;
-		}
-		else
-		{
-			pDstData = (BYTE*)ClipboardGetData(clipboard->system, dstFormatId, &DstSize);
-		}
 
+		pDstData = (BYTE*)ClipboardGetData(clipboard->system, dstFormatId, &DstSize);
 		if (!pDstData)
 		{
 			WLog_WARN(TAG, "failed to get clipboard data in format %s [source format %s]",
@@ -2526,26 +2504,32 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			}
 		}
 
-		// Not hit cache and we successfull called ClipboardGetData
-		if (!hit_cached_data && pDstData)
+		if (!pDstData)
 		{
-			// clipboard->cachedRawData owns cached_raw_data
-			// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
-			cached_data = xf_cached_data_new(pDstData, DstSize);
-			if (cached_data)
-			{
-				if (!HashTable_Insert(clipboard->cachedData, format_to_cache_slot(dstFormatId),
-				                      cached_data))
-				{
-					WLog_WARN(TAG, "Failed to cache clipboard data");
-					xf_cached_data_free(cached_data);
-				}
-			}
-			else
-				WLog_WARN(TAG, "Failed to allocate cache entry");
+			pending->respond->property = None;
+			goto out;
 		}
 
 		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
+
+		// Always cache it again , we have different dstFormat for a src fmt
+		// clipboard->cachedRawData owns cached_raw_data
+		// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
+		cached_data = xf_cached_data_new(pDstData, DstSize);
+		if (!cached_data)
+		{
+			WLog_WARN(TAG, "Failed to allocate cache entry");
+			free(pDstData);
+		}
+		else
+		{
+			if (!HashTable_Insert(clipboard->cachedData, format_to_cache_slot(dstFormatId),
+			                      cached_data))
+			{
+				WLog_WARN(TAG, "Failed to cache clipboard data");
+				xf_cached_data_free(cached_data);
+			}
+		}
 
 	out:
 		xf_cliprdr_provide_selection(clipboard, pending->respond);
