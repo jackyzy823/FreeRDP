@@ -117,11 +117,7 @@ struct xf_clipboard
 	wHashTable* cachedData;
 	wHashTable* cachedRawData;
 
-	// RequestedFormat* requestedFormat;
-
-	/* item SelectionRespond* */
 	wArrayList* pending_responds;
-	/* item SelectionRespond* */
 	wQueue* queued_responds;
 
 	Window owner;
@@ -214,39 +210,6 @@ static void selection_respond_free(void* ptr)
 	requested_format_free(&selection_respond->requestedFormat);
 	free(selection_respond);
 }
-
-// // for ArrayList GetItem and then Remove, it will be free-ed
-// static BOOL selection_respond_deep_copy(SelectionRespond** ppDst, SelectionRespond* pSrc)
-// {
-// 	if (!ppDst)
-// 	{
-// 		return FALSE;
-// 	}
-//
-// 	SelectionRespond* obj = calloc(1, sizeof(SelectionRespond));
-// 	if (!obj)
-// 		return FALSE;
-//
-// 	obj->data_raw_format = pSrc->data_raw_format;
-// 	if (!requested_format_replace(&obj->requestedFormat, pSrc->requestedFormat->formatToRequest,
-// 	                              pSrc->requestedFormat->localFormat,
-// 	                              pSrc->requestedFormat->formatName))
-// 	{
-// 		free(obj);
-// 		return FALSE;
-// 	}
-//
-// 	obj->respond = calloc(1, sizeof(XSelectionEvent));
-// 	if (!obj->respond)
-// 	{
-// 		requested_format_free(&obj->requestedFormat);
-// 		free(obj);
-// 		return FALSE;
-// 	}
-// 	memcpy(obj->respond, pSrc->respond, sizeof(XSelectionEvent));
-// 	*ppDst = obj;
-// 	return True;
-// }
 
 static void xf_cached_data_free(void* ptr)
 {
@@ -1559,23 +1522,18 @@ static BOOL xf_cliprdr_pending_responds_ArrayList_ForEachFkt(void* data, size_t 
 
 	formatId = pendingRespond->requestedFormat->formatToRequest;
 
-	// If anyone in the arraylist has different
 	if (formatId != currentFormatId)
 		*res = TRUE;
 	return TRUE;
 }
 
-#define xf_cliprdr_provide_selection(clipboard, respond) \
-	xf_cliprdr_provide_selection_((clipboard), (respond), __FILE__, __func__, __LINE__)
-static void xf_cliprdr_provide_selection_(xfClipboard* clipboard, const XSelectionEvent* respond,
-                                          const char* file, const char* fkt, size_t line)
+static void xf_cliprdr_provide_selection(xfClipboard* clipboard, const XSelectionEvent* respond)
 {
 	WINPR_ASSERT(clipboard);
 
 	xfContext* xfc = clipboard->xfc;
 	WINPR_ASSERT(xfc);
 
-	// Allow respond->property to be None and
 	union
 	{
 		XEvent* ev;
@@ -1719,9 +1677,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 
 				if (!(selection_respond = (SelectionRespond*)calloc(1, sizeof(SelectionRespond))))
 				{
-					// respond with property none to indicate conversion failed
-					// no delayRespond,
-					//
 					respond->property = None;
 					goto out;
 				}
@@ -1732,25 +1687,6 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				requested_format_replace(&selection_respond->requestedFormat, formatId, dstFormatId,
 				                         cformat->formatName);
 				selection_respond->data_raw_format = rawTransfer;
-				// NOTE: we should ensure all pending_responds has same `formatId` (like 0x0000000d
-				// [CF_UNICODETEXT])
-				//
-				// TODO: if cache data is not hit , if pending_list is not null , and my format ==
-				// pending_list foramt , put it in cache?
-				// TODO: if cache data is not hit , if pending_list is not null , and my format !=
-				// pending_list foramt , put it to a waiting_hashtable, (hashtable[formatid] =
-				// pending_list)
-				//		if cache data is not hit, if pending_list is null and
-				// waiting_hashtable[myformat] is null -->  put it in pending_list and send
-				// send_data_request 		if cache data is not hit, if pending_list is null and
-				// waiting_hashtable[myformat] is not null -->  put it in a waiting_hashtable
-				//
-				//		when response , iterater pending_list ,and clean it up, then if
-				// waiting_hashtable is not null , pop first key 's data, set it to pending_list
-				// (and then unlock pending_list) , and send_data_request 	what if we didn't
-				// receive previous formatId's data_response and then we can't emit
-				// send_data_request for next formatid
-				//
 
 				if (ArrayList_Count(clipboard->pending_responds) > 0)
 				{
@@ -1761,29 +1697,38 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					                            formatId, &shouldQueued);
 					if (!success || shouldQueued)
 					{
-						// different (or uncertain) format , append to queued , not send
-						// data_request (will do in data_response)
-						// TODO failed to enqueue
-						Queue_Enqueue(clipboard->queued_responds, selection_respond);
+						if (!Queue_Enqueue(clipboard->queued_responds, selection_respond))
+						{
+							requested_format_free(&selection_respond->requestedFormat);
+							free(selection_respond);
+							respond->property = None;
+							goto out;
+						}
 					}
 					else
 					{
-						// same format , append to pending , but not send data_request
-						// TODO failed to append
-						ArrayList_Append(clipboard->pending_responds, selection_respond);
+						if (!ArrayList_Append(clipboard->pending_responds, selection_respond))
+						{
+							requested_format_free(&selection_respond->requestedFormat);
+							free(selection_respond);
+							respond->property = None;
+							goto out;
+						}
 					}
 				}
 				else
 				{
+					if (!ArrayList_Append(clipboard->pending_responds, selection_respond))
+					{
+						requested_format_free(&selection_respond->requestedFormat);
+						free(selection_respond);
+						respond->property = None;
+						goto out;
+					}
 					/**
 					 * Send clipboard data request to the server.
 					 * Response will be postponed after receiving the data
 					 */
-					// we will always add current one to the pending_response
-
-					// brand new , add to pendingm and send data_request
-					// TODO failed to append
-					ArrayList_Append(clipboard->pending_responds, selection_respond);
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
 			}
@@ -2329,19 +2274,14 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		while (ArrayList_Count(clipboard->pending_responds) > 0)
 		{
 			SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
-			// set the property argument to None indicates that the conversion requested could not
-			// be made.
+
 			pending->respond->property = None;
 			xf_cliprdr_provide_selection(clipboard, pending->respond);
+
 			ArrayList_Remove(clipboard->pending_responds, pending);
 		}
-		// This goto could be omit, since ArrayList_Count(clipboard->pending_responds) new is 0
-		// here. we can just use next goto
-		goto nextformat;
+		WINPR_ASSERT(ArrayList_Count(clipboard->pending_responds) == 0);
 	}
-
-	if (ArrayList_Count(clipboard->pending_responds) == 0)
-		goto nextformat;
 
 	while (ArrayList_Count(clipboard->pending_responds) > 0)
 	{
@@ -2440,19 +2380,8 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		DEBUG_CLIPRDR("srcFormatId: 0x%08" PRIx32 ", dstFormatId: 0x%08" PRIx32 "", srcFormatId,
 		              dstFormatId);
 
-		// Set data only once
-		if (!bSuccess)
+		if (SrcSize != 0 && !bRawCached)
 		{
-			ClipboardLock(clipboard->system);
-			// TODO what if failed , respond empty data -> target?
-			bSuccess = ClipboardSetData(clipboard->system, srcFormatId, data, SrcSize);
-			ClipboardUnlock(clipboard->system);
-		}
-
-		if (!bRawCached)
-		{
-			// TODO there's no pSrcData  ,  (data is still owned by formatDataResponse)
-			// Always make a raw data cache.
 			/* We have to copy the original data again, as pSrcData is now owned
 			 * by clipboard->system. Memory allocation failure is not fatal here
 			 * as this is only a cached value. */
@@ -2481,6 +2410,19 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			goto out;
 		}
 
+		if (!bSuccess)
+		{
+			ClipboardLock(clipboard->system);
+			bSuccess = ClipboardSetData(clipboard->system, srcFormatId, data, SrcSize);
+			ClipboardUnlock(clipboard->system);
+		}
+
+		if (!bSuccess)
+		{
+			WLog_DBG(TAG, "skipping, ClipboardSetData failed!");
+			goto out;
+		}
+
 		ClipboardLock(clipboard->system);
 
 		pDstData = (BYTE*)ClipboardGetData(clipboard->system, dstFormatId, &DstSize);
@@ -2491,6 +2433,12 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			          ClipboardGetFormatName(clipboard->system, srcFormatId));
 		}
 		ClipboardUnlock(clipboard->system);
+
+		if (!pDstData)
+		{
+			pending->respond->property = None;
+			goto out;
+		}
 
 		if (nullTerminated && pDstData)
 		{
@@ -2504,15 +2452,8 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			}
 		}
 
-		if (!pDstData)
-		{
-			pending->respond->property = None;
-			goto out;
-		}
-
 		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
 
-		// Always cache it again , we have different dstFormat for a src fmt
 		// clipboard->cachedRawData owns cached_raw_data
 		// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
 		cached_data = xf_cached_data_new(pDstData, DstSize);
@@ -2533,18 +2474,12 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 
 	out:
 		xf_cliprdr_provide_selection(clipboard, pending->respond);
-		// whatever success or failed, clean it up
+
 		ArrayList_Remove(clipboard->pending_responds, pending);
 	}
 
-nextformat:
-
+	// Processing data request for next formatId
 	WINPR_ASSERT(ArrayList_Count(clipboard->pending_responds) == 0);
-
-	// get first from queued_responds;
-	// find all other in queued_responds, which has same format id as the first one
-	// put them in pending_responds;
-	// send data_request;
 
 	SelectionRespond* next = Queue_Peek(clipboard->queued_responds);
 	if (next)
@@ -2558,24 +2493,28 @@ nextformat:
 		{
 			if (next->requestedFormat->formatToRequest == nextFormatId)
 			{
-				ArrayList_Append(clipboard->pending_responds, next);
+				if (!ArrayList_Append(clipboard->pending_responds, next))
+				{
+					selection_respond_free(next);
+				}
 			}
 			else
 			{
-				Queue_Enqueue(backlog, next);
+				if (!Queue_Enqueue(backlog, next))
+				{
+					selection_respond_free(next);
+				}
 			}
 		}
 		WINPR_ASSERT(Queue_Count(clipboard->queued_responds) == 0);
 
-		// replace the old queue with backlog , or  push item in backlog into it?
-
-		// what about lock?
-		// Queue_Free(clipboard->queued_responds);
-		// clipboard->queued_responds = backlog;
-
+		SelectionRespond* tmp = nullptr;
 		while (Queue_Count(backlog) > 0)
 		{
-			Queue_Enqueue(clipboard->queued_responds, Queue_Dequeue(backlog));
+			if (!(tmp = Queue_Dequeue(backlog)))
+			{
+				Queue_Enqueue(clipboard->queued_responds, tmp);
+			}
 		}
 		WINPR_ASSERT(Queue_Count(backlog) == 0);
 		Queue_Free(backlog);
