@@ -1633,10 +1633,12 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 			if (rawTransfer)
 				table = clipboard->cachedRawData;
 
+			HashTable_Lock(table);
 			if (!rawTransfer)
 				cached_data = HashTable_GetItemValue(table, format_to_cache_slot(dstFormatId));
 			else
 				cached_data = HashTable_GetItemValue(table, format_to_cache_slot(formatId));
+			HashTable_Unlock(table);
 
 			DEBUG_CLIPRDR("hasCachedData: %u, rawTransfer: %d", cached_data ? 1u : 0u, rawTransfer);
 
@@ -1648,8 +1650,11 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 
 				get_src_format_info_for_local_request(clipboard, cformat, &srcFormatId,
 				                                      &nullTerminated);
+
+				HashTable_Lock(clipboard->cachedRawData);
 				cached_raw_data =
 				    HashTable_GetItemValue(clipboard->cachedRawData, (void*)(UINT_PTR)srcFormatId);
+				HashTable_Unlock(clipboard->cachedRawData);
 
 				DEBUG_CLIPRDR("hasCachedRawData: %u, rawDataLength: %u", cached_raw_data ? 1u : 0u,
 				              cached_raw_data ? cached_raw_data->data_length : 0);
@@ -1688,6 +1693,8 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				                         cformat->formatName);
 				selection_respond->data_raw_format = rawTransfer;
 
+				ArrayList_Lock(clipboard->pending_responds);
+				Queue_Lock(clipboard->queued_responds);
 				if (ArrayList_Count(clipboard->pending_responds) > 0)
 				{
 					BOOL shouldQueued = FALSE;
@@ -1702,7 +1709,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 							requested_format_free(&selection_respond->requestedFormat);
 							free(selection_respond);
 							respond->property = None;
-							goto out;
+							goto out2;
 						}
 					}
 					else
@@ -1712,7 +1719,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 							requested_format_free(&selection_respond->requestedFormat);
 							free(selection_respond);
 							respond->property = None;
-							goto out;
+							goto out2;
 						}
 					}
 				}
@@ -1723,7 +1730,7 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 						requested_format_free(&selection_respond->requestedFormat);
 						free(selection_respond);
 						respond->property = None;
-						goto out;
+						goto out2;
 					}
 					/**
 					 * Send clipboard data request to the server.
@@ -1731,6 +1738,9 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					 */
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
+			out2:
+				Queue_Unlock(clipboard->queued_responds);
+				ArrayList_Unlock(clipboard->pending_responds);
 			}
 		}
 	}
@@ -2268,6 +2278,10 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 	const UINT32 size = formatDataResponse->common.dataLen;
 	const BYTE* data = formatDataResponse->requestedFormatData;
 
+	// Keep the same lock order as process_selection_request to prevent deadlock
+	xf_lock_x11(xfc);
+	ArrayList_Lock(clipboard->pending_responds);
+	Queue_Lock(clipboard->queued_responds);
 	if (formatDataResponse->common.msgFlags == CB_RESPONSE_FAIL)
 	{
 		WLog_WARN(TAG, "Format Data Response PDU msgFlags is CB_RESPONSE_FAIL");
@@ -2521,6 +2535,10 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 
 		xf_cliprdr_send_data_request(clipboard, nextFormatId, cformat);
 	}
+
+	Queue_Unlock(clipboard->queued_responds);
+	ArrayList_Unlock(clipboard->pending_responds);
+	xf_unlock_x11(xfc);
 
 	return CHANNEL_RC_OK;
 }
