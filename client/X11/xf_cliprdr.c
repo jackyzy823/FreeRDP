@@ -2306,6 +2306,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		UINT32 dstFormatId = 0;
 		BOOL nullTerminated = FALSE;
 		xfCachedData* cached_data = nullptr;
+		xfCachedData* hit_cached_data = nullptr;
 
 		SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
 		const RequestedFormat* format = pending->requestedFormat;
@@ -2437,9 +2438,33 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			goto out;
 		}
 
-		ClipboardLock(clipboard->system);
+		wHashTable* table = clipboard->cachedData;
+		if (pending->data_raw_format)
+			table = clipboard->cachedRawData;
 
-		pDstData = (BYTE*)ClipboardGetData(clipboard->system, dstFormatId, &DstSize);
+		HashTable_Lock(table);
+
+		if (!pending->data_raw_format)
+			hit_cached_data = HashTable_GetItemValue(table, format_to_cache_slot(dstFormatId));
+		else
+			hit_cached_data = HashTable_GetItemValue(table, format_to_cache_slot(srcFormatId));
+
+		HashTable_Unlock(table);
+
+		DEBUG_CLIPRDR("hasCachedData: %u, pending->data_raw_format: %d", hit_cached_data ? 1u : 0u,
+		              pending->data_raw_format);
+
+		ClipboardLock(clipboard->system);
+		if (hit_cached_data)
+		{
+			pDstData = hit_cached_data->data;
+			DstSize = hit_cached_data->data_length;
+		}
+		else
+		{
+			pDstData = (BYTE*)ClipboardGetData(clipboard->system, dstFormatId, &DstSize);
+		}
+
 		if (!pDstData)
 		{
 			WLog_WARN(TAG, "failed to get clipboard data in format %s [source format %s]",
@@ -2466,23 +2491,29 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 			}
 		}
 
-		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
-
 		// clipboard->cachedRawData owns cached_raw_data
 		// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
-		cached_data = xf_cached_data_new(pDstData, DstSize);
-		if (!cached_data)
+		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
+
+		if (!hit_cached_data && pDstData)
 		{
-			WLog_WARN(TAG, "Failed to allocate cache entry");
-			free(pDstData);
-		}
-		else
-		{
-			if (!HashTable_Insert(clipboard->cachedData, format_to_cache_slot(dstFormatId),
-			                      cached_data))
+			cached_data = xf_cached_data_new(pDstData, DstSize);
+			if (!cached_data)
 			{
-				WLog_WARN(TAG, "Failed to cache clipboard data");
-				xf_cached_data_free(cached_data);
+
+				free(pDstData);
+				WLog_WARN(TAG, "Failed to allocate cache entry");
+			}
+			else
+			{
+				HashTable_Lock(clipboard->cachedData);
+				if (!HashTable_Insert(clipboard->cachedData, format_to_cache_slot(dstFormatId),
+				                      cached_data))
+				{
+					WLog_WARN(TAG, "Failed to cache clipboard data");
+					xf_cached_data_free(cached_data);
+				}
+				HashTable_Unlock(clipboard->cachedData);
 			}
 		}
 
