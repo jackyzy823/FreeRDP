@@ -80,10 +80,10 @@ typedef struct
 
 typedef struct
 {
-	XSelectionEvent* respond;
+	XSelectionEvent* expectedResponse;
 	RequestedFormat* requestedFormat;
 	BOOL data_raw_format;
-} SelectionRespond;
+} SelectionResponse;
 
 struct xf_clipboard
 {
@@ -117,8 +117,8 @@ struct xf_clipboard
 	wHashTable* cachedData;
 	wHashTable* cachedRawData;
 
-	wArrayList* pending_responds;
-	wQueue* queued_responds;
+	wArrayList* pending_responses;
+	wQueue* queued_responses;
 
 	Window owner;
 	BOOL sync;
@@ -201,14 +201,15 @@ static BOOL requested_format_replace(RequestedFormat** ppRequestedFormat, UINT32
 	return TRUE;
 }
 
-static void selection_respond_free(void* ptr)
+static void selection_response_free(void* ptr)
 {
-	SelectionRespond* selection_respond = (SelectionRespond*)ptr;
-	WINPR_ASSERT(selection_respond);
+	SelectionResponse* selection_response = (SelectionResponse*)ptr;
+	if (!selection_response)
+		return;
 
-	free(selection_respond->respond);
-	requested_format_free(&selection_respond->requestedFormat);
-	free(selection_respond);
+	free(selection_response->expectedResponse);
+	requested_format_free(&selection_response->requestedFormat);
+	free(selection_response);
 }
 
 static void xf_cached_data_free(void* ptr)
@@ -1510,10 +1511,10 @@ static xfCachedData* convert_data_from_existing_raw_data(xfClipboard* clipboard,
 }
 
 WINPR_ATTR_NODISCARD
-static BOOL xf_cliprdr_pending_responds_ArrayList_ForEachFkt(void* data, size_t index, va_list ap)
+static BOOL xf_cliprdr_pending_responses_ArrayList_ForEachFkt(void* data, size_t index, va_list ap)
 {
 	UINT32 formatId = 0;
-	SelectionRespond* pendingRespond = (SelectionRespond*)data;
+	SelectionResponse* pendingResponse = (SelectionResponse*)data;
 	UINT32 currentFormatId = va_arg(ap, UINT32);
 	BOOL* res = va_arg(ap, BOOL*);
 
@@ -1521,7 +1522,7 @@ static BOOL xf_cliprdr_pending_responds_ArrayList_ForEachFkt(void* data, size_t 
 	WINPR_UNUSED(ap);
 	WINPR_ASSERT(res);
 
-	formatId = pendingRespond->requestedFormat->formatToRequest;
+	formatId = pendingResponse->requestedFormat->formatToRequest;
 
 	if (formatId != currentFormatId)
 		*res = TRUE;
@@ -1678,47 +1679,47 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 			}
 			else
 			{
-				SelectionRespond* selection_respond = nullptr;
+				SelectionResponse* selection_response = nullptr;
 				WINPR_ASSERT(cformat);
 
-				if (!(selection_respond = (SelectionRespond*)calloc(1, sizeof(SelectionRespond))))
+				if (!(selection_response =
+				          (SelectionResponse*)calloc(1, sizeof(SelectionResponse))))
 				{
 					respond->property = None;
 					goto out;
 				}
 				respond->property = xevent->property;
-				delayRespond = TRUE;
 
-				selection_respond->respond = respond;
-				requested_format_replace(&selection_respond->requestedFormat, formatId, dstFormatId,
-				                         cformat->formatName);
-				selection_respond->data_raw_format = rawTransfer;
+				selection_response->expectedResponse = respond;
+				requested_format_replace(&selection_response->requestedFormat, formatId,
+				                         dstFormatId, cformat->formatName);
+				selection_response->data_raw_format = rawTransfer;
 
-				ArrayList_Lock(clipboard->pending_responds);
-				Queue_Lock(clipboard->queued_responds);
-				if (ArrayList_Count(clipboard->pending_responds) > 0)
+				ArrayList_Lock(clipboard->pending_responses);
+				Queue_Lock(clipboard->queued_responses);
+				if (ArrayList_Count(clipboard->pending_responses) > 0)
 				{
 					BOOL shouldQueued = FALSE;
 					BOOL success = FALSE;
-					success = ArrayList_ForEach(clipboard->pending_responds,
-					                            xf_cliprdr_pending_responds_ArrayList_ForEachFkt,
+					success = ArrayList_ForEach(clipboard->pending_responses,
+					                            xf_cliprdr_pending_responses_ArrayList_ForEachFkt,
 					                            formatId, &shouldQueued);
 					if (!success || shouldQueued)
 					{
-						if (!Queue_Enqueue(clipboard->queued_responds, selection_respond))
+						if (!Queue_Enqueue(clipboard->queued_responses, selection_response))
 						{
-							requested_format_free(&selection_respond->requestedFormat);
-							free(selection_respond);
+							requested_format_free(&selection_response->requestedFormat);
+							free(selection_response);
 							respond->property = None;
 							goto out2;
 						}
 					}
 					else
 					{
-						if (!ArrayList_Append(clipboard->pending_responds, selection_respond))
+						if (!ArrayList_Append(clipboard->pending_responses, selection_response))
 						{
-							requested_format_free(&selection_respond->requestedFormat);
-							free(selection_respond);
+							requested_format_free(&selection_response->requestedFormat);
+							free(selection_response);
 							respond->property = None;
 							goto out2;
 						}
@@ -1726,10 +1727,10 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 				}
 				else
 				{
-					if (!ArrayList_Append(clipboard->pending_responds, selection_respond))
+					if (!ArrayList_Append(clipboard->pending_responses, selection_response))
 					{
-						requested_format_free(&selection_respond->requestedFormat);
-						free(selection_respond);
+						requested_format_free(&selection_response->requestedFormat);
+						free(selection_response);
 						respond->property = None;
 						goto out2;
 					}
@@ -1739,9 +1740,10 @@ static BOOL xf_cliprdr_process_selection_request(xfClipboard* clipboard,
 					 */
 					xf_cliprdr_send_data_request(clipboard, formatId, cformat);
 				}
+				delayRespond = TRUE;
 			out2:
-				Queue_Unlock(clipboard->queued_responds);
-				ArrayList_Unlock(clipboard->pending_responds);
+				Queue_Unlock(clipboard->queued_responses);
+				ArrayList_Unlock(clipboard->pending_responses);
 			}
 		}
 	}
@@ -2100,8 +2102,8 @@ static UINT xf_cliprdr_server_format_list(CliprdrClientContext* context,
 	xf_lock_x11(xfc);
 
 	/* Clear the active SelectionRequest, as it is now invalid */
-	ArrayList_Clear(clipboard->pending_responds);
-	Queue_Clear(clipboard->queued_responds);
+	ArrayList_Clear(clipboard->pending_responses);
+	Queue_Clear(clipboard->queued_responses);
 
 	xf_clipboard_formats_free(clipboard);
 	xf_cliprdr_clear_cached_data(clipboard);
@@ -2281,24 +2283,24 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 
 	// Keep the same lock order as process_selection_request to prevent deadlock
 	xf_lock_x11(xfc);
-	ArrayList_Lock(clipboard->pending_responds);
-	Queue_Lock(clipboard->queued_responds);
+	ArrayList_Lock(clipboard->pending_responses);
+	Queue_Lock(clipboard->queued_responses);
 	if (formatDataResponse->common.msgFlags == CB_RESPONSE_FAIL)
 	{
 		WLog_WARN(TAG, "Format Data Response PDU msgFlags is CB_RESPONSE_FAIL");
-		while (ArrayList_Count(clipboard->pending_responds) > 0)
+		while (ArrayList_Count(clipboard->pending_responses) > 0)
 		{
-			SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
+			SelectionResponse* pending = ArrayList_GetItem(clipboard->pending_responses, 0);
 
-			pending->respond->property = None;
-			xf_cliprdr_provide_selection(clipboard, pending->respond);
+			pending->expectedResponse->property = None;
+			xf_cliprdr_provide_selection(clipboard, pending->expectedResponse);
 
-			ArrayList_Remove(clipboard->pending_responds, pending);
+			ArrayList_Remove(clipboard->pending_responses, pending);
 		}
-		WINPR_ASSERT(ArrayList_Count(clipboard->pending_responds) == 0);
+		WINPR_ASSERT(ArrayList_Count(clipboard->pending_responses) == 0);
 	}
 
-	while (ArrayList_Count(clipboard->pending_responds) > 0)
+	while (ArrayList_Count(clipboard->pending_responses) > 0)
 	{
 		BYTE* pDstData = nullptr;
 		UINT32 DstSize = 0;
@@ -2309,7 +2311,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		xfCachedData* cached_data = nullptr;
 		xfCachedData* hit_cached_data = nullptr;
 
-		SelectionRespond* pending = ArrayList_GetItem(clipboard->pending_responds, 0);
+		SelectionResponse* pending = ArrayList_GetItem(clipboard->pending_responses, 0);
 		const RequestedFormat* format = pending->requestedFormat;
 		if (pending->data_raw_format)
 		{
@@ -2318,7 +2320,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		}
 		else if (!format)
 		{
-			pending->respond->property = None;
+			pending->expectedResponse->property = None;
 			goto out;
 		}
 		else if (format->formatName)
@@ -2340,8 +2342,8 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 					WLog_WARN(TAG, "failed to update file descriptors");
 
 				srcFormatId = ClipboardGetFormatId(clipboard->system, type_FileGroupDescriptorW);
-				const xfCliprdrFormat* dstTargetFormat =
-				    xf_cliprdr_get_client_format_by_atom(clipboard, pending->respond->target);
+				const xfCliprdrFormat* dstTargetFormat = xf_cliprdr_get_client_format_by_atom(
+				    clipboard, pending->expectedResponse->target);
 				if (!dstTargetFormat)
 				{
 					dstFormatId = ClipboardGetFormatId(clipboard->system, mime_uri_list);
@@ -2476,7 +2478,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 
 		if (!pDstData)
 		{
-			pending->respond->property = None;
+			pending->expectedResponse->property = None;
 			goto out;
 		}
 
@@ -2494,7 +2496,7 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 
 		// clipboard->cachedRawData owns cached_raw_data
 		// NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
-		xf_cliprdr_provide_data(clipboard, pending->respond, pDstData, DstSize);
+		xf_cliprdr_provide_data(clipboard, pending->expectedResponse, pDstData, DstSize);
 
 		if (!hit_cached_data && pDstData)
 		{
@@ -2519,57 +2521,61 @@ xf_cliprdr_server_format_data_response(CliprdrClientContext* context,
 		}
 
 	out:
-		xf_cliprdr_provide_selection(clipboard, pending->respond);
+		xf_cliprdr_provide_selection(clipboard, pending->expectedResponse);
 
-		ArrayList_Remove(clipboard->pending_responds, pending);
+		ArrayList_Remove(clipboard->pending_responses, pending);
 	}
 
 	// Processing data request for next formatId
-	WINPR_ASSERT(ArrayList_Count(clipboard->pending_responds) == 0);
+	WINPR_ASSERT(ArrayList_Count(clipboard->pending_responses) == 0);
 
-	SelectionRespond* next = Queue_Peek(clipboard->queued_responds);
+	SelectionResponse* next = Queue_Peek(clipboard->queued_responses);
 	if (next)
 	{
 		UINT32 nextFormatId = next->requestedFormat->formatToRequest;
 		const xfCliprdrFormat* cformat =
-		    xf_cliprdr_get_client_format_by_atom(clipboard, next->respond->target);
+		    xf_cliprdr_get_client_format_by_atom(clipboard, next->expectedResponse->target);
 
 		wQueue* backlog = Queue_New(FALSE, -1, -1);
-		while ((next = Queue_Dequeue(clipboard->queued_responds)) != nullptr)
+		if (!backlog)
+		{
+			goto out2;
+		}
+		while ((next = Queue_Dequeue(clipboard->queued_responses)) != nullptr)
 		{
 			if (next->requestedFormat->formatToRequest == nextFormatId)
 			{
-				if (!ArrayList_Append(clipboard->pending_responds, next))
+				if (!ArrayList_Append(clipboard->pending_responses, next))
 				{
-					selection_respond_free(next);
+					selection_response_free(next);
 				}
 			}
 			else
 			{
 				if (!Queue_Enqueue(backlog, next))
 				{
-					selection_respond_free(next);
+					selection_response_free(next);
 				}
 			}
 		}
-		WINPR_ASSERT(Queue_Count(clipboard->queued_responds) == 0);
+		WINPR_ASSERT(Queue_Count(clipboard->queued_responses) == 0);
 
-		SelectionRespond* tmp = nullptr;
+		SelectionResponse* tmp = nullptr;
 		while (Queue_Count(backlog) > 0)
 		{
 			if (!(tmp = Queue_Dequeue(backlog)))
 			{
-				Queue_Enqueue(clipboard->queued_responds, tmp);
+				Queue_Enqueue(clipboard->queued_responses, tmp);
 			}
 		}
 		WINPR_ASSERT(Queue_Count(backlog) == 0);
 		Queue_Free(backlog);
-
+	out2:
 		xf_cliprdr_send_data_request(clipboard, nextFormatId, cformat);
 	}
 
-	Queue_Unlock(clipboard->queued_responds);
-	ArrayList_Unlock(clipboard->pending_responds);
+	Queue_Unlock(clipboard->queued_responses);
+	ArrayList_Unlock(clipboard->pending_responses);
 	xf_unlock_x11(xfc);
 
 	return CHANNEL_RC_OK;
@@ -2832,17 +2838,17 @@ xfClipboard* xf_clipboard_new(xfContext* xfc, BOOL relieveFilenameRestriction)
 	obj = HashTable_ValueObject(clipboard->cachedRawData);
 	obj->fnObjectFree = xf_cached_data_free;
 
-	clipboard->pending_responds = ArrayList_New(TRUE);
-	if (!clipboard->pending_responds)
+	clipboard->pending_responses = ArrayList_New(TRUE);
+	if (!clipboard->pending_responses)
 		goto fail;
-	obj = ArrayList_Object(clipboard->pending_responds);
-	obj->fnObjectFree = selection_respond_free;
+	obj = ArrayList_Object(clipboard->pending_responses);
+	obj->fnObjectFree = selection_response_free;
 
-	clipboard->queued_responds = Queue_New(TRUE, -1, -1);
-	if (!clipboard->queued_responds)
+	clipboard->queued_responses = Queue_New(TRUE, -1, -1);
+	if (!clipboard->queued_responses)
 		goto fail;
-	obj = Queue_Object(clipboard->queued_responds);
-	obj->fnObjectFree = selection_respond_free;
+	obj = Queue_Object(clipboard->queued_responses);
+	obj->fnObjectFree = selection_response_free;
 
 	return clipboard;
 
@@ -2876,8 +2882,8 @@ void xf_clipboard_free(xfClipboard* clipboard)
 	xf_clipboard_formats_free(clipboard);
 	HashTable_Free(clipboard->cachedRawData);
 	HashTable_Free(clipboard->cachedData);
-	ArrayList_Free(clipboard->pending_responds);
-	Queue_Free(clipboard->queued_responds);
+	ArrayList_Free(clipboard->pending_responses);
+	Queue_Free(clipboard->queued_responses);
 	free(clipboard->incr_data);
 	free(clipboard);
 }
